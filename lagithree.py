@@ -340,6 +340,39 @@ class EnhancedVoxelConverter(QMainWindow):
         self.video_slider.sliderMoved.connect(self.seek_video_from_slider)
         main_layout.addWidget(self.video_slider)
 
+        # Add SliceView specific controls
+        sliceview_group = QGroupBox("SliceView Options")
+        sliceview_layout = QVBoxLayout()
+        sliceview_group.setLayout(sliceview_layout)
+
+        # Number of layers slider
+        layer_count_layout = QHBoxLayout()
+        layer_count_layout.addWidget(QLabel("Layer Count:"))
+        self.layer_slider = QSlider(Qt.Horizontal)
+        self.layer_slider.setRange(3, 8)
+        self.layer_slider.setValue(5)
+        layer_count_layout.addWidget(self.layer_slider)
+        sliceview_layout.addLayout(layer_count_layout)
+
+        # Layer spacing slider
+        spacing_layout = QHBoxLayout()
+        spacing_layout.addWidget(QLabel("Layer Spacing:"))
+        self.spacing_slider = QSlider(Qt.Horizontal)
+        self.spacing_slider.setRange(10, 50)
+        self.spacing_slider.setValue(20)
+        spacing_layout.addWidget(self.spacing_slider)
+        sliceview_layout.addLayout(spacing_layout)
+
+        # Export button
+        export_layout = QHBoxLayout()
+        self.export_button = QPushButton("Export for SliceView")
+        self.export_button.clicked.connect(self.export_for_sliceview)
+        export_layout.addWidget(self.export_button)
+        sliceview_layout.addLayout(export_layout)
+
+        # Add SliceView group to main layout
+        control_layout.addWidget(sliceview_group)
+
     def change_render_style(self, index):
         """Change the rendering style based on combobox selection"""
         style_map = {
@@ -505,15 +538,18 @@ class EnhancedVoxelConverter(QMainWindow):
             
             # Get video properties
             self.frame_rate = self.video_capture.get(cv2.CAP_PROP_FPS)
-            frame_count = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.total_duration = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT) / self.frame_rate * 1000)  # Total duration in ms
             frame_width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            self.log_debug(f"Video properties: {frame_width}x{frame_height}, {self.frame_rate} FPS, {frame_count} frames")
+            self.log_debug(f"Video properties: {frame_width}x{frame_height}, {self.frame_rate} FPS, {self.total_duration} ms")
             
             if self.frame_rate <= 0:
                 self.frame_rate = 30  # Default if unable to determine
                 self.log_debug(f"Invalid frame rate detected, using default: {self.frame_rate} FPS")
+            
+            # Update slider range
+            self.video_slider.setRange(0, self.total_duration)
             
             # Read first frame
             success, frame = self.video_capture.read()
@@ -620,11 +656,10 @@ class EnhancedVoxelConverter(QMainWindow):
         self.process_frame(frame)
         
         # Update the slider position
-        current_position = self.video_capture.get(cv2.CAP_PROP_POS_MSEC)
-        total_duration = self.video_capture.get(cv2.CAP_PROP_POS_MSEC)
-        if total_duration > 0:
-            slider_value = int((current_position / total_duration) * 100)
-            self.video_slider.setValue(slider_value)
+        current_position = int(self.video_capture.get(cv2.CAP_PROP_POS_MSEC))
+        self.video_slider.blockSignals(True)  # Prevent triggering sliderMoved signal
+        self.video_slider.setValue(current_position)
+        self.video_slider.blockSignals(False)
 
         # Calculate and record processing time
         end_time = time.time()
@@ -1193,10 +1228,95 @@ class EnhancedVoxelConverter(QMainWindow):
     def seek_video_from_slider(self, position):
         """Seek video based on slider position"""
         if self.video_capture:
-            # Calculate the position in milliseconds
-            total_duration = self.video_capture.get(cv2.CAP_PROP_POS_MSEC)
-            new_position = (position / 100) * total_duration
-            self.seek_video(new_position)
+            # Seek video
+            self.video_capture.set(cv2.CAP_PROP_POS_MSEC, position)
+            
+            # Seek audio
+            if self.audio_enabled:
+                self.media_player.setPosition(position)
+            
+            # Read and display new frame
+            success, frame = self.video_capture.read()
+            if success:
+                self.current_frame = frame
+                self.process_frame(frame)
+
+    def process_frame_for_sliceview(self, frame):
+        """Process a frame to create a SliceView-like visualization"""
+        try:
+            # Get enhanced depth map
+            depth_map = self.enhanced_depth_estimation(frame)
+            
+            # Slice into layers
+            layers, layer_masks = self.slice_into_depth_layers(frame, depth_map)
+            
+            # Create visualization
+            sliceview_viz = self.render_sliceview_visualization(layers)
+            
+            # Store the layers for potential export or display
+            self.depth_layers = layers
+            self.depth_layer_masks = layer_masks
+            
+            # Convert to Qt format for display
+            h, w = sliceview_viz.shape[:2]
+            bytes_per_line = 3 * w
+            qt_image = QImage(sliceview_viz.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            self.current_pixmap = QPixmap.fromImage(qt_image)
+            
+            # Display the result
+            self.update_display()
+            
+            # Update status
+            num_layers = len(layers)
+            self.status_label.setText(f"SliceView visualization with {num_layers} depth layers")
+            
+        except Exception as e:
+            error_msg = f"Error processing frame for SliceView: {str(e)}"
+            self.log_debug(f"ERROR: {error_msg}")
+            self.status_label.setText(error_msg)
+
+    def export_for_sliceview(self):
+        """Export the current depth layers for a SliceView physical display"""
+        try:
+            if not hasattr(self, 'depth_layers') or not self.depth_layers:
+                self.log_debug("No depth layers available to export")
+                return
+            
+            # Ask user for export directory
+            export_dir = QFileDialog.getExistingDirectory(
+                self, "Select Export Directory", "", QFileDialog.ShowDirsOnly
+            )
+            
+            if not export_dir:
+                return
+                
+            # Create directory if it doesn't exist
+            if not os.path.exists(export_dir):
+                os.makedirs(export_dir)
+            
+            # Export each layer with proper transformations for SliceView
+            for i, layer in enumerate(self.depth_layers):
+                # Apply vertical mirroring as mentioned in the paper
+                mirrored_layer = cv2.flip(layer, 0)
+                
+                # Save layer
+                layer_filename = os.path.join(export_dir, f"layer_{i}.png")
+                cv2.imwrite(layer_filename, mirrored_layer)
+            
+            # Export configuration file with layer spacing information
+            config_path = os.path.join(export_dir, "sliceview_config.txt")
+            with open(config_path, 'w') as f:
+                f.write(f"Number of layers: {len(self.depth_layers)}\n")
+                f.write(f"Recommended angle: 45 degrees\n")
+                f.write("Layer spacing: uniform\n")
+                
+            self.log_debug(f"Exported {len(self.depth_layers)} layers to {export_dir}")
+            self.status_label.setText(f"SliceView layers exported to {export_dir}")
+            
+        except Exception as e:
+            error_msg = f"Error exporting for SliceView: {str(e)}"
+            self.log_debug(f"ERROR: {error_msg}")
+            self.status_label.setText(error_msg)
 
 def main():
     try:

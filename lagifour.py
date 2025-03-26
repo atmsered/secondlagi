@@ -340,6 +340,39 @@ class EnhancedVoxelConverter(QMainWindow):
         self.video_slider.sliderMoved.connect(self.seek_video_from_slider)
         main_layout.addWidget(self.video_slider)
 
+        # Add SliceView specific controls
+        sliceview_group = QGroupBox("SliceView Options")
+        sliceview_layout = QVBoxLayout()
+        sliceview_group.setLayout(sliceview_layout)
+
+        # Number of layers slider
+        layer_count_layout = QHBoxLayout()
+        layer_count_layout.addWidget(QLabel("Layer Count:"))
+        self.layer_slider = QSlider(Qt.Horizontal)
+        self.layer_slider.setRange(3, 8)
+        self.layer_slider.setValue(5)
+        layer_count_layout.addWidget(self.layer_slider)
+        sliceview_layout.addLayout(layer_count_layout)
+
+        # Layer spacing slider
+        spacing_layout = QHBoxLayout()
+        spacing_layout.addWidget(QLabel("Layer Spacing:"))
+        self.spacing_slider = QSlider(Qt.Horizontal)
+        self.spacing_slider.setRange(10, 50)
+        self.spacing_slider.setValue(20)
+        spacing_layout.addWidget(self.spacing_slider)
+        sliceview_layout.addLayout(spacing_layout)
+
+        # Export button
+        export_layout = QHBoxLayout()
+        self.export_button = QPushButton("Export for SliceView")
+        self.export_button.clicked.connect(self.export_for_sliceview)
+        export_layout.addWidget(self.export_button)
+        sliceview_layout.addLayout(export_layout)
+
+        # Add SliceView group to main layout
+        control_layout.addWidget(sliceview_group)
+
     def change_render_style(self, index):
         """Change the rendering style based on combobox selection"""
         style_map = {
@@ -505,15 +538,18 @@ class EnhancedVoxelConverter(QMainWindow):
             
             # Get video properties
             self.frame_rate = self.video_capture.get(cv2.CAP_PROP_FPS)
-            frame_count = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.total_duration = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT) / self.frame_rate * 1000)  # Total duration in ms
             frame_width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            self.log_debug(f"Video properties: {frame_width}x{frame_height}, {self.frame_rate} FPS, {frame_count} frames")
+            self.log_debug(f"Video properties: {frame_width}x{frame_height}, {self.frame_rate} FPS, {self.total_duration} ms")
             
             if self.frame_rate <= 0:
                 self.frame_rate = 30  # Default if unable to determine
                 self.log_debug(f"Invalid frame rate detected, using default: {self.frame_rate} FPS")
+            
+            # Update slider range
+            self.video_slider.setRange(0, self.total_duration)
             
             # Read first frame
             success, frame = self.video_capture.read()
@@ -620,11 +656,10 @@ class EnhancedVoxelConverter(QMainWindow):
         self.process_frame(frame)
         
         # Update the slider position
-        current_position = self.video_capture.get(cv2.CAP_PROP_POS_MSEC)
-        total_duration = self.video_capture.get(cv2.CAP_PROP_POS_MSEC)
-        if total_duration > 0:
-            slider_value = int((current_position / total_duration) * 100)
-            self.video_slider.setValue(slider_value)
+        current_position = int(self.video_capture.get(cv2.CAP_PROP_POS_MSEC))
+        self.video_slider.blockSignals(True)  # Prevent triggering sliderMoved signal
+        self.video_slider.setValue(current_position)
+        self.video_slider.blockSignals(False)
 
         # Calculate and record processing time
         end_time = time.time()
@@ -1193,10 +1228,95 @@ class EnhancedVoxelConverter(QMainWindow):
     def seek_video_from_slider(self, position):
         """Seek video based on slider position"""
         if self.video_capture:
-            # Calculate the position in milliseconds
-            total_duration = self.video_capture.get(cv2.CAP_PROP_POS_MSEC)
-            new_position = (position / 100) * total_duration
-            self.seek_video(new_position)
+            # Seek video
+            self.video_capture.set(cv2.CAP_PROP_POS_MSEC, position)
+            
+            # Seek audio
+            if self.audio_enabled:
+                self.media_player.setPosition(position)
+            
+            # Read and display new frame
+            success, frame = self.video_capture.read()
+            if success:
+                self.current_frame = frame
+                self.process_frame(frame)
+
+    def process_frame_for_sliceview(self, frame):
+        """Process a frame to create a SliceView-like visualization"""
+        try:
+            # Get enhanced depth map
+            depth_map = self.enhanced_depth_estimation(frame)
+            
+            # Slice into layers
+            layers, layer_masks = self.slice_into_depth_layers(frame, depth_map)
+            
+            # Create visualization
+            sliceview_viz = self.render_sliceview_visualization(layers)
+            
+            # Store the layers for potential export or display
+            self.depth_layers = layers
+            self.depth_layer_masks = layer_masks
+            
+            # Convert to Qt format for display
+            h, w = sliceview_viz.shape[:2]
+            bytes_per_line = 3 * w
+            qt_image = QImage(sliceview_viz.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            self.current_pixmap = QPixmap.fromImage(qt_image)
+            
+            # Display the result
+            self.update_display()
+            
+            # Update status
+            num_layers = len(layers)
+            self.status_label.setText(f"SliceView visualization with {num_layers} depth layers")
+            
+        except Exception as e:
+            error_msg = f"Error processing frame for SliceView: {str(e)}"
+            self.log_debug(f"ERROR: {error_msg}")
+            self.status_label.setText(error_msg)
+
+    def export_for_sliceview(self):
+        """Export the current depth layers for a SliceView physical display"""
+        try:
+            if not hasattr(self, 'depth_layers') or not self.depth_layers:
+                self.log_debug("No depth layers available to export")
+                return
+            
+            # Ask user for export directory
+            export_dir = QFileDialog.getExistingDirectory(
+                self, "Select Export Directory", "", QFileDialog.ShowDirsOnly
+            )
+            
+            if not export_dir:
+                return
+                
+            # Create directory if it doesn't exist
+            if not os.path.exists(export_dir):
+                os.makedirs(export_dir)
+            
+            # Export each layer with proper transformations for SliceView
+            for i, layer in enumerate(self.depth_layers):
+                # Apply vertical mirroring as mentioned in the paper
+                mirrored_layer = cv2.flip(layer, 0)
+                
+                # Save layer
+                layer_filename = os.path.join(export_dir, f"layer_{i}.png")
+                cv2.imwrite(layer_filename, mirrored_layer)
+            
+            # Export configuration file with layer spacing information
+            config_path = os.path.join(export_dir, "sliceview_config.txt")
+            with open(config_path, 'w') as f:
+                f.write(f"Number of layers: {len(self.depth_layers)}\n")
+                f.write(f"Recommended angle: 45 degrees\n")
+                f.write("Layer spacing: uniform\n")
+                
+            self.log_debug(f"Exported {len(self.depth_layers)} layers to {export_dir}")
+            self.status_label.setText(f"SliceView layers exported to {export_dir}")
+            
+        except Exception as e:
+            error_msg = f"Error exporting for SliceView: {str(e)}"
+            self.log_debug(f"ERROR: {error_msg}")
+            self.status_label.setText(error_msg)
 
 def main():
     try:
@@ -1214,3 +1334,869 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def slice_into_depth_layers(self, frame, depth_map):
+    """Slice a frame into multiple depth layers based on depth map"""
+    try:
+        # Get number of layers from slider
+        num_layers = self.layer_slider.value()
+        
+        # Get depth range
+        depth_min = np.min(depth_map)
+        depth_max = np.max(depth_map)
+        
+        # Prevent division by zero
+        if depth_max == depth_min:
+            depth_max = depth_min + 1
+            
+        # Create layers and masks
+        layers = []
+        layer_masks = []
+        
+        # Calculate depth boundaries for each layer
+        depth_range = depth_max - depth_min
+        step = depth_range / num_layers
+        
+        for i in range(num_layers):
+            # Calculate depth range for this layer
+            lower_bound = depth_min + i * step
+            upper_bound = depth_min + (i + 1) * step
+            
+            # Create binary mask for this depth range
+            layer_mask = np.logical_and(
+                depth_map >= lower_bound,
+                depth_map < upper_bound
+            ).astype(np.uint8) * 255
+            
+            # Apply spacing adjustments based on slider
+            spacing_factor = self.spacing_slider.value() / 20.0  # normalize to 0.5-2.5
+            
+            # Apply Gaussian blur to smooth the mask edges
+            smoothing = self.smoothing_slider.value() / 100.0
+            if smoothing > 0:
+                blur_amount = int(3 + smoothing * 10)
+                # Make sure blur amount is odd
+                if blur_amount % 2 == 0:
+                    blur_amount += 1
+                layer_mask = cv2.GaussianBlur(layer_mask, (blur_amount, blur_amount), 0)
+            
+            # Get frame content for this layer
+            layer = np.zeros_like(frame)
+            layer[layer_mask > 128] = frame[layer_mask > 128]
+            
+            # Store layer and mask
+            layers.append(layer)
+            layer_masks.append(layer_mask)
+            
+        return layers, layer_masks
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in slicing layers: {str(e)}")
+        return [], []
+
+def enhanced_depth_estimation(self, frame):
+    """Create an enhanced depth map with multiple techniques"""
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Apply bilateral filter for smoother depth transitions while preserving edges
+        smoothing = self.smoothing_slider.value() / 100.0
+        if smoothing > 0:
+            d = int(5 + smoothing * 10)
+            sigma_color = 75
+            sigma_space = 75
+            gray = cv2.bilateralFilter(gray, d, sigma_color, sigma_space)
+        
+        # Initialize depth map with grayscale
+        depth_map = gray.copy()
+        
+        # Person segmentation for better depth
+        if self.person_checkbox.isChecked():
+            person_mask = self.segment_person(frame)
+            if person_mask is not None:
+                # Convert mask to binary
+                person_area = person_mask > 128
+                
+                # Create a distance map for background
+                if np.any(person_area):
+                    bg_mask = 255 - person_mask
+                    dist_transform = cv2.distanceTransform(bg_mask, cv2.DIST_L2, 5)
+                    dist_transform = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    
+                    # Apply Gaussian blur to smooth the distance transform
+                    if smoothing > 0:
+                        blur_amount = int(5 + smoothing * 15)
+                        if blur_amount % 2 == 0:
+                            blur_amount += 1
+                        dist_transform = cv2.GaussianBlur(dist_transform, (blur_amount, blur_amount), 0)
+                    
+                    # Create enhanced depth map
+                    depth_map = depth_map.copy()
+                    depth_map[person_area] = depth_map[person_area] * 0.3  # Make person closer
+                    
+                    # Background gets deeper based on distance from person
+                    bg_area = ~person_area
+                    if np.any(bg_area):
+                        scale_factor = self.depth_range_slider.value() / 100.0
+                        depth_map[bg_area] = np.maximum(
+                            depth_map[bg_area], 
+                            dist_transform[bg_area] * scale_factor
+                        )
+        
+        # Edge enhancement for better depth boundaries
+        if self.edge_checkbox.isChecked():
+            edges = cv2.Canny(gray, 100, 200)
+            edges = cv2.dilate(edges, None)
+            
+            # Apply Gaussian blur to smooth the edges
+            if smoothing > 0:
+                blur_amount = int(3 + smoothing * 5)
+                if blur_amount % 2 == 0:
+                    blur_amount += 1
+                edges = cv2.GaussianBlur(edges, (blur_amount, blur_amount), 0)
+            
+            depth_map = cv2.addWeighted(depth_map, 0.7, edges, 0.3, 0)
+            
+        return depth_map
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in depth estimation: {str(e)}")
+        return np.zeros_like(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+
+def render_sliceview_visualization(self, layers):
+    """Create a SliceView-like visualization of the layers"""
+    try:
+        if not layers:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+            
+        num_layers = len(layers)
+        
+        # Determine visualization dimensions
+        layer_height, layer_width = layers[0].shape[:2]
+        spacing = self.spacing_slider.value()
+        
+        # Create canvas for visualization
+        canvas_width = layer_width
+        canvas_height = layer_height + spacing * (num_layers - 1)
+        canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+        
+        # Place layers on canvas with offset
+        for i, layer in enumerate(layers):
+            y_offset = i * spacing
+            
+            # Get layer region in canvas
+            layer_region = canvas[y_offset:y_offset + layer_height, :, :]
+            
+            # Ensure layers don't exceed canvas boundaries
+            if layer_region.shape[:2] != layer.shape[:2]:
+                continue
+                
+            # Add layer to canvas
+            mask = (layer > 0).any(axis=2)
+            layer_region[mask] = layer[mask]
+            
+        return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in sliceview visualization: {str(e)}")
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+def integrate_retro_emulator(self, rom_path, emulator_type="genesis"):
+    """Integrate with a retro game emulator to render layered game output"""
+    try:
+        # This is a placeholder for the actual emulator integration
+        # In a real implementation, you'd need to connect to your modified emulator
+        
+        self.log_debug(f"Attempting to load ROM: {rom_path} with emulator: {emulator_type}")
+        
+        # Create command to launch the modified emulator
+        if emulator_type == "genesis":
+            # Example command structure for modified Helios emulator
+            cmd = [
+                "python", "modified_helios.py",
+                "--rom", rom_path,
+                "--layers", str(self.layer_slider.value()),
+                "--spacing", str(self.spacing_slider.value()),
+                "--output-dir", "temp_layers/"
+            ]
+            
+            # In real implementation: 
+            # 1. Launch process
+            # 2. Communicate with emulator (pipe/socket)
+            # 3. Receive frame data for each layer
+            
+            self.log_debug(f"Emulator command: {' '.join(cmd)}")
+            self.status_label.setText(f"Launching {emulator_type} emulator...")
+            
+            # For now, simulate receiving layers
+            self.load_simulated_retro_layers()
+            
+        else:
+            self.log_debug(f"Unsupported emulator type: {emulator_type}")
+            
+    except Exception as e:
+        error_msg = f"Error integrating retro emulator: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        self.status_label.setText(error_msg)
+
+def load_simulated_retro_layers(self):
+    """Simulate loading retro game layers for testing SliceView integration"""
+    try:
+        # Create simulated layers (in real implementation, get from emulator)
+        h, w = 480, 640
+        layers = []
+        
+        # Number of layers based on slider
+        num_layers = self.layer_slider.value()
+        
+        # Generate simple layers to demonstrate the concept
+        for i in range(num_layers):
+            layer = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            # Different content for each layer to simulate game layers
+            if i == 0:  # Background
+                # Sky blue background
+                layer[:, :] = [100, 150, 255]
+            elif i == 1:  # Distant mountains/clouds
+                # Draw some gray mountains
+                for x in range(0, w, 20):
+                    height = np.random.randint(100, 200)
+                    pts = np.array([[x, h], [x+20, h], [x+10, h-height]])
+                    cv2.fillPoly(layer, [pts], (100, 100, 100))
+            elif i == 2:  # Mid-ground elements
+                # Green hills
+                for x in range(-20, w, 40):
+                    height = np.random.randint(50, 100)
+                    cv2.circle(layer, (x, h+30), height, (0, 150, 0), -1)
+            elif i == num_layers - 1:  # Foreground/character layer
+                # Character placeholder (simple shape)
+                cv2.rectangle(layer, (w//2-15, h-100), (w//2+15, h-50), (255, 0, 0), -1)
+                cv2.circle(layer, (w//2, h-120), 20, (255, 200, 200), -1)
+            else:
+                # Intermediate layers
+                for _ in range(10):
+                    x = np.random.randint(0, w)
+                    y = np.random.randint(h//2, h)
+                    size = np.random.randint(10, 30)
+                    color = [np.random.randint(0, 255) for _ in range(3)]
+                    cv2.rectangle(layer, (x-size//2, y-size//2), (x+size//2, y+size//2), color, -1)
+            
+            layers.append(layer)
+        
+        # Store the layers for display and export
+        self.depth_layers = layers
+        
+        # Create visualization
+        viz = self.render_sliceview_visualization(layers)
+        
+        # Convert to Qt format for display
+        h, w = viz.shape[:2]
+        bytes_per_line = 3 * w
+        qt_image = QImage(viz.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.current_pixmap = QPixmap.fromImage(qt_image)
+        
+        # Display the result
+        self.update_display()
+        
+        self.log_debug(f"Loaded {num_layers} simulated retro game layers")
+        self.status_label.setText("Simulated retro game layers loaded")
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in simulated retro layers: {str(e)}")
+
+def generate_sliceview_output(self, layers):
+    """Generate properly formatted output for a physical SliceView display"""
+    try:
+        processed_layers = []
+        
+        for i, layer in enumerate(layers):
+            # 1. Vertical mirroring (required by SliceView as mentioned in the paper)
+            mirrored = cv2.flip(layer, 0)
+            
+            # 2. Apply keystone correction if needed
+            # Create simple keystone correction matrix
+            # This is a placeholder - actual correction would be calibrated per device
+            src_points = np.float32([[0, 0], [layer.shape[1], 0], 
+                                     [0, layer.shape[0]], [layer.shape[1], layer.shape[0]]])
+            # Slight keystone effect
+            offset = int(layer.shape[1] * 0.05) * (i / len(layers))
+            dst_points = np.float32([[offset, 0], [layer.shape[1]-offset, 0], 
+                                     [0, layer.shape[0]], [layer.shape[1], layer.shape[0]]])
+            
+            transform_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+            keystone_corrected = cv2.warpPerspective(mirrored, transform_matrix, 
+                                                   (mirrored.shape[1], mirrored.shape[0]))
+            
+            # 3. Re-scale proportionally to layer distance
+            # Deeper layers appear smaller due to perspective
+            scale_factor = 1.0 - (i * 0.05)  # Decrease size slightly for deeper layers
+            width = int(layer.shape[1] * scale_factor)
+            height = int(layer.shape[0] * scale_factor)
+            
+            if width > 0 and height > 0:  # Ensure valid dimensions
+                resized = cv2.resize(keystone_corrected, (width, height))
+                
+                # Center the resized image in a frame of original size
+                frame = np.zeros_like(layer)
+                y_offset = (layer.shape[0] - height) // 2
+                x_offset = (layer.shape[1] - width) // 2
+                
+                frame[y_offset:y_offset+height, x_offset:x_offset+width] = resized
+                processed_layers.append(frame)
+            else:
+                processed_layers.append(keystone_corrected)  # Fallback
+        
+        return processed_layers
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in SliceView output generation: {str(e)}")
+        return layers  # Return original layers as fallback
+    
+def slice_into_depth_layers(self, frame, depth_map):
+    """Slice a frame into multiple depth layers based on depth map"""
+    try:
+        # Get number of layers from slider
+        num_layers = self.layer_slider.value()
+        
+        # Get depth range
+        depth_min = np.min(depth_map)
+        depth_max = np.max(depth_map)
+        
+        # Prevent division by zero
+        if depth_max == depth_min:
+            depth_max = depth_min + 1
+            
+        # Create layers and masks
+        layers = []
+        layer_masks = []
+        
+        # Calculate depth boundaries for each layer
+        depth_range = depth_max - depth_min
+        step = depth_range / num_layers
+        
+        for i in range(num_layers):
+            # Calculate depth range for this layer
+            lower_bound = depth_min + i * step
+            upper_bound = depth_min + (i + 1) * step
+            
+            # Create binary mask for this depth range
+            layer_mask = np.logical_and(
+                depth_map >= lower_bound,
+                depth_map < upper_bound
+            ).astype(np.uint8) * 255
+            
+            # Apply spacing adjustments based on slider
+            spacing_factor = self.spacing_slider.value() / 20.0  # normalize to 0.5-2.5
+            
+            # Apply Gaussian blur to smooth the mask edges
+            smoothing = self.smoothing_slider.value() / 100.0
+            if smoothing > 0:
+                blur_amount = int(3 + smoothing * 10)
+                # Make sure blur amount is odd
+                if blur_amount % 2 == 0:
+                    blur_amount += 1
+                layer_mask = cv2.GaussianBlur(layer_mask, (blur_amount, blur_amount), 0)
+            
+            # Get frame content for this layer
+            layer = np.zeros_like(frame)
+            layer[layer_mask > 128] = frame[layer_mask > 128]
+            
+            # Store layer and mask
+            layers.append(layer)
+            layer_masks.append(layer_mask)
+            
+        return layers, layer_masks
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in slicing layers: {str(e)}")
+        return [], []
+
+def enhanced_depth_estimation(self, frame):
+    """Create an enhanced depth map with multiple techniques"""
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Apply bilateral filter for smoother depth transitions while preserving edges
+        smoothing = self.smoothing_slider.value() / 100.0
+        if smoothing > 0:
+            d = int(5 + smoothing * 10)
+            sigma_color = 75
+            sigma_space = 75
+            gray = cv2.bilateralFilter(gray, d, sigma_color, sigma_space)
+        
+        # Initialize depth map with grayscale
+        depth_map = gray.copy()
+        
+        # Person segmentation for better depth
+        if self.person_checkbox.isChecked():
+            person_mask = self.segment_person(frame)
+            if person_mask is not None:
+                # Convert mask to binary
+                person_area = person_mask > 128
+                
+                # Create a distance map for background
+                if np.any(person_area):
+                    bg_mask = 255 - person_mask
+                    dist_transform = cv2.distanceTransform(bg_mask, cv2.DIST_L2, 5)
+                    dist_transform = cv2.normalize(dist_transform, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    
+                    # Apply Gaussian blur to smooth the distance transform
+                    if smoothing > 0:
+                        blur_amount = int(5 + smoothing * 15)
+                        if blur_amount % 2 == 0:
+                            blur_amount += 1
+                        dist_transform = cv2.GaussianBlur(dist_transform, (blur_amount, blur_amount), 0)
+                    
+                    # Create enhanced depth map
+                    depth_map = depth_map.copy()
+                    depth_map[person_area] = depth_map[person_area] * 0.3  # Make person closer
+                    
+                    # Background gets deeper based on distance from person
+                    bg_area = ~person_area
+                    if np.any(bg_area):
+                        scale_factor = self.depth_range_slider.value() / 100.0
+                        depth_map[bg_area] = np.maximum(
+                            depth_map[bg_area], 
+                            dist_transform[bg_area] * scale_factor
+                        )
+        
+        # Edge enhancement for better depth boundaries
+        if self.edge_checkbox.isChecked():
+            edges = cv2.Canny(gray, 100, 200)
+            edges = cv2.dilate(edges, None)
+            
+            # Apply Gaussian blur to smooth the edges
+            if smoothing > 0:
+                blur_amount = int(3 + smoothing * 5)
+                if blur_amount % 2 == 0:
+                    blur_amount += 1
+                edges = cv2.GaussianBlur(edges, (blur_amount, blur_amount), 0)
+            
+            depth_map = cv2.addWeighted(depth_map, 0.7, edges, 0.3, 0)
+            
+        return depth_map
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in depth estimation: {str(e)}")
+        return np.zeros_like(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+
+def render_sliceview_visualization(self, layers):
+    """Create a SliceView-like visualization of the layers"""
+    try:
+        if not layers:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+            
+        num_layers = len(layers)
+        
+        # Determine visualization dimensions
+        layer_height, layer_width = layers[0].shape[:2]
+        spacing = self.spacing_slider.value()
+        
+        # Create canvas for visualization
+        canvas_width = layer_width
+        canvas_height = layer_height + spacing * (num_layers - 1)
+        canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+        
+        # Place layers on canvas with offset
+        for i, layer in enumerate(layers):
+            y_offset = i * spacing
+            
+            # Get layer region in canvas
+            layer_region = canvas[y_offset:y_offset + layer_height, :, :]
+            
+            # Ensure layers don't exceed canvas boundaries
+            if layer_region.shape[:2] != layer.shape[:2]:
+                continue
+                
+            # Add layer to canvas
+            mask = (layer > 0).any(axis=2)
+            layer_region[mask] = layer[mask]
+            
+        return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in sliceview visualization: {str(e)}")
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+def generate_sliceview_output(self, layers):
+    """Generate properly formatted output for a physical SliceView display"""
+    try:
+        processed_layers = []
+        
+        for i, layer in enumerate(layers):
+            # 1. Vertical mirroring (required by SliceView as mentioned in the paper)
+            mirrored = cv2.flip(layer, 0)
+            
+            # 2. Apply keystone correction if needed
+            # Create simple keystone correction matrix
+            # This is a placeholder - actual correction would be calibrated per device
+            src_points = np.float32([[0, 0], [layer.shape[1], 0], 
+                                     [0, layer.shape[0]], [layer.shape[1], layer.shape[0]]])
+            # Slight keystone effect
+            offset = int(layer.shape[1] * 0.05) * (i / len(layers))
+            dst_points = np.float32([[offset, 0], [layer.shape[1]-offset, 0], 
+                                     [0, layer.shape[0]], [layer.shape[1], layer.shape[0]]])
+            
+            transform_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+            keystone_corrected = cv2.warpPerspective(mirrored, transform_matrix, 
+                                                   (mirrored.shape[1], mirrored.shape[0]))
+            
+            # 3. Re-scale proportionally to layer distance
+            # Deeper layers appear smaller due to perspective
+            scale_factor = 1.0 - (i * 0.05)  # Decrease size slightly for deeper layers
+            width = int(layer.shape[1] * scale_factor)
+            height = int(layer.shape[0] * scale_factor)
+            
+            if width > 0 and height > 0:  # Ensure valid dimensions
+                resized = cv2.resize(keystone_corrected, (width, height))
+                
+                # Center the resized image in a frame of original size
+                frame = np.zeros_like(layer)
+                y_offset = (layer.shape[0] - height) // 2
+                x_offset = (layer.shape[1] - width) // 2
+                
+                frame[y_offset:y_offset+height, x_offset:x_offset+width] = resized
+                processed_layers.append(frame)
+            else:
+                processed_layers.append(keystone_corrected)  # Fallback
+        
+        return processed_layers
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in SliceView output generation: {str(e)}")
+        return layers  # Return original layers as fallback
+def integrate_retro_emulator(self, rom_path, emulator_type="genesis"):
+    """Integrate with a retro game emulator to render layered game output"""
+    try:
+        # This is a placeholder for the actual emulator integration
+        # In a real implementation, you'd need to connect to your modified emulator
+        
+        self.log_debug(f"Attempting to load ROM: {rom_path} with emulator: {emulator_type}")
+        
+        # Create command to launch the modified emulator
+        if emulator_type == "genesis":
+            # Example command structure for modified Helios emulator
+            cmd = [
+                "python", "modified_helios.py",
+                "--rom", rom_path,
+                "--layers", str(self.layer_slider.value()),
+                "--spacing", str(self.spacing_slider.value()),
+                "--output-dir", "temp_layers/"
+            ]
+            
+            # In real implementation: 
+            # 1. Launch process
+            # 2. Communicate with emulator (pipe/socket)
+            # 3. Receive frame data for each layer
+            
+            self.log_debug(f"Emulator command: {' '.join(cmd)}")
+            self.status_label.setText(f"Launching {emulator_type} emulator...")
+            
+            # For now, simulate receiving layers
+            self.load_simulated_retro_layers()
+            
+        else:
+            self.log_debug(f"Unsupported emulator type: {emulator_type}")
+            
+    except Exception as e:
+        error_msg = f"Error integrating retro emulator: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        self.status_label.setText(error_msg)
+
+def load_simulated_retro_layers(self):
+    """Simulate loading retro game layers for testing SliceView integration"""
+    try:
+        # Create simulated layers (in real implementation, get from emulator)
+        h, w = 480, 640
+        layers = []
+        
+        # Number of layers based on slider
+        num_layers = self.layer_slider.value()
+        
+        # Generate simple layers to demonstrate the concept
+        for i in range(num_layers):
+            layer = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            # Different content for each layer to simulate game layers
+            if i == 0:  # Background
+                # Sky blue background
+                layer[:, :] = [100, 150, 255]
+            elif i == 1:  # Distant mountains/clouds
+                # Draw some gray mountains
+                for x in range(0, w, 20):
+                    height = np.random.randint(100, 200)
+                    pts = np.array([[x, h], [x+20, h], [x+10, h-height]])
+                    cv2.fillPoly(layer, [pts], (100, 100, 100))
+            elif i == 2:  # Mid-ground elements
+                # Green hills
+                for x in range(-20, w, 40):
+                    height = np.random.randint(50, 100)
+                    cv2.circle(layer, (x, h+30), height, (0, 150, 0), -1)
+            elif i == num_layers - 1:  # Foreground/character layer
+                # Character placeholder (simple shape)
+                cv2.rectangle(layer, (w//2-15, h-100), (w//2+15, h-50), (255, 0, 0), -1)
+                cv2.circle(layer, (w//2, h-120), 20, (255, 200, 200), -1)
+            else:
+                # Intermediate layers
+                for _ in range(10):
+                    x = np.random.randint(0, w)
+                    y = np.random.randint(h//2, h)
+                    size = np.random.randint(10, 30)
+                    color = [np.random.randint(0, 255) for _ in range(3)]
+                    cv2.rectangle(layer, (x-size//2, y-size//2), (x+size//2, y+size//2), color, -1)
+            
+            layers.append(layer)
+        
+        # Store the layers for display and export
+        self.depth_layers = layers
+        
+        # Create visualization
+        viz = self.render_sliceview_visualization(layers)
+        
+        # Convert to Qt format for display
+        h, w = viz.shape[:2]
+        bytes_per_line = 3 * w
+        qt_image = QImage(viz.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.current_pixmap = QPixmap.fromImage(qt_image)
+        
+        # Display the result
+        self.update_display()
+        
+        self.log_debug(f"Loaded {num_layers} simulated retro game layers")
+        self.status_label.setText("Simulated retro game layers loaded")
+        
+    except Exception as e:
+        self.log_debug(f"ERROR in simulated retro layers: {str(e)}")
+def export_for_sliceview(self):
+    """Export the current depth layers for a SliceView physical display"""
+    try:
+        # If we have a current frame but no depth layers, generate them
+        if self.current_frame is not None and (not hasattr(self, 'depth_layers') or not self.depth_layers):
+            self.log_debug("No depth layers available, generating from current frame")
+            depth_map = self.enhanced_depth_estimation(self.current_frame)
+            self.depth_layers, _ = self.slice_into_depth_layers(self.current_frame, depth_map)
+            
+        if not hasattr(self, 'depth_layers') or not self.depth_layers:
+            self.log_debug("No depth layers available to export")
+            QMessageBox.warning(self, "Warning", "No depth layers available to export")
+            return
+            
+        # Generate properly formatted layers for SliceView
+        processed_layers = self.generate_sliceview_output(self.depth_layers)
+        
+        # Ask user for export directory
+        export_dir = QFileDialog.getExistingDirectory(
+            self, "Select Export Directory", "", QFileDialog.ShowDirsOnly
+        )
+        
+        if not export_dir:
+            return
+            
+        # Create directory if it doesn't exist
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+        
+        # Export each layer with proper transformations for SliceView
+        for i, layer in enumerate(processed_layers):
+            # Save layer
+            layer_filename = os.path.join(export_dir, f"layer_{i}.png")
+            cv2.imwrite(layer_filename, cv2.cvtColor(layer, cv2.COLOR_RGB2BGR))  # Convert back to BGR for OpenCV
+        
+        # Export configuration file with layer spacing information
+        config_path = os.path.join(export_dir, "sliceview_config.txt")
+        with open(config_path, 'w') as f:
+            f.write(f"Number of layers: {len(processed_layers)}\n")
+            f.write(f"Recommended angle: 45 degrees\n")
+            spacing_value = self.spacing_slider.value()
+            f.write(f"Layer spacing: {spacing_value}mm\n")
+            f.write("Format: PNG image files\n")
+            f.write("Notes: Images are pre-processed with vertical mirroring and keystone correction\n")
+            
+        self.log_debug(f"Exported {len(processed_layers)} layers to {export_dir}")
+        
+        # Show success message
+        QMessageBox.information(
+            self,
+            "Export Successful",
+            f"Successfully exported {len(processed_layers)} layers to {export_dir}"
+        )
+        
+        self.status_label.setText(f"SliceView layers exported to {export_dir}")
+        
+    except Exception as e:
+        error_msg = f"Error exporting for SliceView: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        self.status_label.setText(error_msg)
+        QMessageBox.critical(self, "Export Error", error_msg)
+
+def load_rom(self):
+    """Load a ROM file for retro gaming with SliceView layers"""
+    try:
+        self.log_debug("Opening file dialog to select ROM")
+        
+        # Open file dialog for ROM selection
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open ROM File", "", "ROM Files (*.md *.bin *.smd *.gen *.rom *.nes *.sfc *.smc)"
+        )
+        
+        if not file_path:
+            self.log_debug("No ROM file selected")
+            return
+            
+        # Determine emulator type based on file extension
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        emulator_type = None
+        if ext in ['.md', '.bin', '.smd', '.gen']:
+            emulator_type = "genesis"
+        elif ext == '.nes':
+            emulator_type = "nes"
+        elif ext in ['.sfc', '.smc']:
+            emulator_type = "snes"
+        else:
+            self.log_debug(f"Unsupported ROM format: {ext}")
+            QMessageBox.warning(self, "Warning", f"Unsupported ROM format: {ext}")
+            return
+            
+        # Integrate with the appropriate emulator
+        self.integrate_retro_emulator(file_path, emulator_type)
+        
+    except Exception as e:
+        error_msg = f"Error loading ROM: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        QMessageBox.critical(self, "Error", error_msg)
+def load_rom(self):
+    """Load a ROM file for retro gaming with SliceView layers"""
+    try:
+        self.log_debug("Opening file dialog to select ROM")
+        
+        # Open file dialog for ROM selection
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open ROM File", "", "ROM Files (*.md *.bin *.smd *.gen *.rom *.nes *.sfc *.smc)"
+        )
+        
+        if not file_path:
+            self.log_debug("No ROM file selected")
+            return
+            
+        # Determine emulator type based on file extension
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        emulator_type = None
+        if ext in ['.md', '.bin', '.smd', '.gen']:
+            emulator_type = "genesis"
+        elif ext == '.nes':
+            emulator_type = "nes"
+        elif ext in ['.sfc', '.smc']:
+            emulator_type = "snes"
+        else:
+            self.log_debug(f"Unsupported ROM format: {ext}")
+            QMessageBox.warning(self, "Warning", f"Unsupported ROM format: {ext}")
+            return
+            
+        # Integrate with the appropriate emulator
+        self.integrate_retro_emulator(file_path, emulator_type)
+        
+    except Exception as e:
+        error_msg = f"Error loading ROM: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        QMessageBox.critical(self, "Error", error_msg)
+
+def switch_to_sliceview_mode(self):
+    """Switch rendering mode to SliceView visualization"""
+    try:
+        # Check if we have a current frame
+        if self.current_frame is None:
+            self.log_debug("No frame available for SliceView mode")
+            QMessageBox.warning(self, "Warning", "Load a video or ROM first")
+            return
+            
+        # Process the current frame for SliceView
+        self.process_frame_for_sliceview(self.current_frame)
+        
+        # Update status
+        self.status_label.setText("SliceView mode enabled")
+        self.log_debug("Switched to SliceView visualization mode")
+        
+    except Exception as e:
+        error_msg = f"Error switching to SliceView mode: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        self.status_label.setText(error_msg)
+
+# Add Load ROM button
+rom_layout = QHBoxLayout()
+self.load_rom_button = QPushButton("Load ROM for SliceView")
+self.load_rom_button.clicked.connect(self.load_rom)
+rom_layout.addWidget(self.load_rom_button)
+sliceview_layout.addLayout(rom_layout)
+
+# Add a button to switch to SliceView mode
+sliceview_mode_layout = QHBoxLayout()
+self.sliceview_mode_button = QPushButton("Switch to SliceView Mode")
+self.sliceview_mode_button.clicked.connect(self.switch_to_sliceview_mode)
+sliceview_mode_layout.addWidget(self.sliceview_mode_button)
+sliceview_layout.addLayout(sliceview_mode_layout)
+
+def export_for_sliceview(self):
+    """Export the current depth layers for a SliceView physical display"""
+    try:
+        # If we have a current frame but no depth layers, generate them
+        if self.current_frame is not None and not hasattr(self, 'depth_layers') or not self.depth_layers:
+            self.log_debug("No depth layers available, generating from current frame")
+            depth_map = self.enhanced_depth_estimation(self.current_frame)
+            self.depth_layers, _ = self.slice_into_depth_layers(self.current_frame, depth_map)
+            
+        if not hasattr(self, 'depth_layers') or not self.depth_layers:
+            self.log_debug("No depth layers available to export")
+            QMessageBox.warning(self, "Warning", "No depth layers available to export")
+            return
+            
+        # Generate properly formatted layers for SliceView
+        processed_layers = self.generate_sliceview_output(self.depth_layers)
+        
+        # Ask user for export directory
+        export_dir = QFileDialog.getExistingDirectory(
+            self, "Select Export Directory", "", QFileDialog.ShowDirsOnly
+        )
+        
+        if not export_dir:
+            return
+            
+        # Create directory if it doesn't exist
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+        
+        # Export each layer with proper transformations for SliceView
+        for i, layer in enumerate(processed_layers):
+            # Save layer
+            layer_filename = os.path.join(export_dir, f"layer_{i}.png")
+            cv2.imwrite(layer_filename, cv2.cvtColor(layer, cv2.COLOR_RGB2BGR))  # Convert back to BGR for OpenCV
+        
+        # Export configuration file with layer spacing information
+        config_path = os.path.join(export_dir, "sliceview_config.txt")
+        with open(config_path, 'w') as f:
+            f.write(f"Number of layers: {len(processed_layers)}\n")
+            f.write(f"Recommended angle: 45 degrees\n")
+            spacing_value = self.spacing_slider.value()
+            f.write(f"Layer spacing: {spacing_value}mm\n")
+            f.write("Format: PNG image files\n")
+            f.write("Notes: Images are pre-processed with vertical mirroring and keystone correction\n")
+            
+        self.log_debug(f"Exported {len(processed_layers)} layers to {export_dir}")
+        
+        # Show success message
+        QMessageBox.information(
+            self,
+            "Export Successful",
+            f"Successfully exported {len(processed_layers)} layers to {export_dir}"
+        )
+        
+        self.status_label.setText(f"SliceView layers exported to {export_dir}")
+        
+    except Exception as e:
+        error_msg = f"Error exporting for SliceView: {str(e)}"
+        self.log_debug(f"ERROR: {error_msg}")
+        self.status_label.setText(error_msg)
+        QMessageBox.critical(self, "Export Error", error_msg)
